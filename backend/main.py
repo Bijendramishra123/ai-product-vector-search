@@ -2,13 +2,14 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
+import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from db import get_connection
 from similarity import cosine_similarity
 
 app = FastAPI()
 
-# CORS
+# ✅ Enable CORS for frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,53 +21,67 @@ app.add_middleware(
 class SearchRequest(BaseModel):
     query: str
 
-
+# Load products from database
 def load_products():
-    try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT product_id, product_name FROM products_vectors")
-        data = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        return data
-    except Exception as e:
-        print("DB ERROR:", e)
-        return []
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT product_id, product_name FROM products_vectors")
 
+    data = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    return data
+
+# Cache products in memory
+products = load_products()
+texts = [p[1] for p in products]
+
+# TF-IDF vectorizer
+vectorizer = TfidfVectorizer()
+tfidf_matrix = vectorizer.fit_transform(texts)
 
 @app.post("/search")
 def search_products(req: SearchRequest):
 
-    try:
-        products = load_products()
+    query = req.query.lower()
 
-        if len(products) == 0:
-            return [{"error": "database empty"}]
+    # Convert query to vector
+    query_vec = vectorizer.transform([query]).toarray()[0]
 
-        texts = [p[1] for p in products]
+    results = []
 
-        vectorizer = TfidfVectorizer()
-        tfidf_matrix = vectorizer.fit_transform(texts)
+    # Compare similarity
+    for i, (pid, name) in enumerate(products):
+        product_vec = tfidf_matrix[i].toarray()[0]
+        score = cosine_similarity(query_vec, product_vec)
 
-        query_vec = vectorizer.transform([req.query]).toarray()[0]
+        # bonus ranking for direct match
+        if query in name.lower():
+            score += 0.1
 
-        results = []
+        results.append({
+            "product_id": pid,
+            "product_name": name,
+            "score": float(score)
+        })
 
-        for i, (pid, name) in enumerate(products):
-            product_vec = tfidf_matrix[i].toarray()[0]
-            score = cosine_similarity(query_vec, product_vec)
+    # Sort best first
+    results.sort(key=lambda x: x["score"], reverse=True)
 
-            results.append({
-                "product_id": pid,
-                "product_name": name,
-                "score": float(score)
-            })
+    # Remove duplicate-like names
+    unique = []
+    seen = set()
 
-        results.sort(key=lambda x: x["score"], reverse=True)
+    for r in results:
+        base_name = r["product_name"].split(" ")[0:3]  # rough normalization
+        key = " ".join(base_name)
 
-        return results[:5]
+        if key not in seen:
+            unique.append(r)
+            seen.add(key)
 
-    except Exception as e:
-        print("SEARCH ERROR:", e)
-        return [{"error": "search failed"}]
+        if len(unique) == 5:
+            break
+
+    return unique
