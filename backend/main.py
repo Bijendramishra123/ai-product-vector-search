@@ -9,10 +9,10 @@ from similarity import cosine_similarity
 
 app = FastAPI()
 
-# ✅ CORS FIX (frontend access allow)
+# ✅ Enable CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # allow all origins (safe for demo)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -21,7 +21,7 @@ app.add_middleware(
 class SearchRequest(BaseModel):
     query: str
 
-# Load products from DB
+# Load products from database
 def load_products():
     conn = get_connection()
     cursor = conn.cursor()
@@ -44,8 +44,10 @@ tfidf_matrix = vectorizer.fit_transform(texts)
 @app.post("/search")
 def search_products(req: SearchRequest):
 
+    query = req.query.lower()
+
     # Convert query to vector
-    query_vec = vectorizer.transform([req.query]).toarray()[0]
+    query_vec = vectorizer.transform([query]).toarray()[0]
 
     results = []
 
@@ -54,13 +56,32 @@ def search_products(req: SearchRequest):
         product_vec = tfidf_matrix[i].toarray()[0]
         score = cosine_similarity(query_vec, product_vec)
 
+        # bonus ranking for direct match
+        if query in name.lower():
+            score += 0.1
+
         results.append({
             "product_id": pid,
             "product_name": name,
             "score": float(score)
         })
 
-    # Sort by best match
+    # Sort best first
     results.sort(key=lambda x: x["score"], reverse=True)
 
-    return results[:5]
+    # Remove duplicate-like names
+    unique = []
+    seen = set()
+
+    for r in results:
+        base_name = r["product_name"].split(" ")[0:3]  # rough normalization
+        key = " ".join(base_name)
+
+        if key not in seen:
+            unique.append(r)
+            seen.add(key)
+
+        if len(unique) == 5:
+            break
+
+    return unique
