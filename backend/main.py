@@ -2,93 +2,108 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
+import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from db import get_connection
 from similarity import cosine_similarity
 
 app = FastAPI()
 
-# ✅ Enable CORS for frontend
+# -----------------------------------
+# ✅ Enable CORS (frontend access allow)
+# -----------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # allow all for demo
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# -----------------------------------
+# Request model
+# -----------------------------------
 class SearchRequest(BaseModel):
     query: str
 
-
-# Load products from database safely
+# -----------------------------------
+# Load products from DB
+# -----------------------------------
 def load_products():
-    try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT product_id, product_name FROM products_vectors")
-        data = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        return data
-    except Exception as e:
-        print("DB ERROR:", e)
-        return []
+    conn = get_connection()
+    cursor = conn.cursor()
 
+    cursor.execute("SELECT product_id, product_name FROM products_vectors")
+    data = cursor.fetchall()
 
+    cursor.close()
+    conn.close()
+
+    return data
+
+# -----------------------------------
+# Cache products in memory
+# -----------------------------------
+products = load_products()
+
+# safety check
+if not products:
+    raise Exception("No products found in database!")
+
+texts = [p[1].lower() for p in products]
+
+# -----------------------------------
+# Build TF-IDF matrix once
+# -----------------------------------
+vectorizer = TfidfVectorizer()
+tfidf_matrix = vectorizer.fit_transform(texts)
+
+# -----------------------------------
+# Search endpoint
+# -----------------------------------
 @app.post("/search")
 def search_products(req: SearchRequest):
 
-    try:
-        products = load_products()
+    query = req.query.strip().lower()
 
-        if len(products) == 0:
-            return [{"error": "database empty"}]
+    # Convert query to vector
+    query_vec = vectorizer.transform([query]).toarray()[0]
 
-        texts = [p[1] for p in products]
+    results = []
 
-        vectorizer = TfidfVectorizer()
-        tfidf_matrix = vectorizer.fit_transform(texts)
+    # Compare similarity with all products
+    for i, (pid, name) in enumerate(products):
+        product_vec = tfidf_matrix[i].toarray()[0]
 
-        query = req.query.lower()
-        query_vec = vectorizer.transform([query]).toarray()[0]
+        score = cosine_similarity(query_vec, product_vec)
 
-        results = []
+        # bonus ranking for direct substring match
+        if query in name.lower():
+            score += 0.1
 
-        for i, (pid, name) in enumerate(products):
-            product_vec = tfidf_matrix[i].toarray()[0]
-            score = cosine_similarity(query_vec, product_vec)
+        results.append({
+            "product_id": pid,
+            "product_name": name,
+            "score": float(score)
+        })
 
-            # bonus ranking for direct match
-            if query in name.lower():
-                score += 0.1
+    # Sort best first
+    results.sort(key=lambda x: x["score"], reverse=True)
 
-            results.append({
-                "product_id": pid,
-                "product_name": name,
-                "score": float(score)
-            })
+    # -----------------------------------
+    # ✅ Remove duplicate names
+    # -----------------------------------
+    unique = []
+    seen = set()
 
-        # Sort best first
-        results.sort(key=lambda x: x["score"], reverse=True)
+    for r in results:
+        name = r["product_name"].strip().lower()
 
-        # Remove duplicate-like names
-        unique = []
-        seen = set()
+        if name not in seen:
+            unique.append(r)
+            seen.add(name)
 
-        for r in results:
-            base_name = r["product_name"].split(" ")[0:3]
-            key = " ".join(base_name)
+        if len(unique) == 5:
+            break
 
-            if key not in seen:
-                unique.append(r)
-                seen.add(key)
-
-            if len(unique) == 5:
-                break
-
-        return unique
-
-    except Exception as e:
-        print("SEARCH ERROR:", e)
-        return [{"error": "search failed"}]
+    return unique
